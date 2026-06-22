@@ -80,12 +80,14 @@ async def receive_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bots[token] = {
             "bot_token": token,
             "bot_username": bot_info.username,
+            "admin_id": uid,
             "welcome_message": "Welcome!",
             "menus": {},
         }
     else:
         # Token already registered — just refresh the username
         bots[token]["bot_username"] = bot_info.username
+        bots[token]["admin_id"] = uid
 
     db.collection("users").document(str(uid)).set({
         "admin_id": uid,
