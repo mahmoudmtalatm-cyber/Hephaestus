@@ -65,10 +65,14 @@ def get_user_data(uid, token=None):
     doc = db.collection("users").document(str(uid)).get()
     data = doc.to_dict() if doc.exists else {}
     if token:
-        # Return per-token sub-document if available
+        # Return per-token sub-document, but fill in top-level fields that
+        # aren't stored per-token (like admin_id) so callers always find them
         bots = data.get("bots", {})
         if token in bots:
-            return bots[token]
+            merged = dict(bots[token])
+            if "admin_id" not in merged:
+                merged["admin_id"] = data.get("admin_id")
+            return merged
     return data
 
 def save_menus(uid, menus, token=None):
