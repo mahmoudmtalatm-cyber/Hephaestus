@@ -62,18 +62,44 @@ async def receive_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     existing = db.collection("users").document(str(uid)).get()
     existing_data = existing.to_dict() if existing.exists else {}
 
+    # Store all bots as a list keyed by token so each gets its own config
+    bots = existing_data.get("bots", {})
+
+    # Migrate legacy single-token field if present
+    legacy_token = existing_data.get("bot_token")
+    if legacy_token and legacy_token not in bots:
+        bots[legacy_token] = {
+            "bot_token": legacy_token,
+            "bot_username": existing_data.get("bot_username", ""),
+            "welcome_message": existing_data.get("welcome_message", "Welcome!"),
+            "menus": existing_data.get("menus", {}),
+        }
+
+    # Add or update this token's entry
+    if token not in bots:
+        bots[token] = {
+            "bot_token": token,
+            "bot_username": bot_info.username,
+            "welcome_message": "Welcome!",
+            "menus": {},
+        }
+    else:
+        # Token already registered — just refresh the username
+        bots[token]["bot_username"] = bot_info.username
+
     db.collection("users").document(str(uid)).set({
-        "bot_token": token,
         "admin_id": uid,
+        "bots": bots,
+        # Keep legacy field pointing at latest token so old runner code doesn't break
+        "bot_token": token,
         "bot_username": bot_info.username,
-        "welcome_message": existing_data.get("welcome_message", "Welcome!"),
-        "menus": existing_data.get("menus", {}),
     }, merge=True)
 
+    already = "🔄 Already registered — refreshed!" if token in existing_data.get("bots", {}) else "✅ Activated!"
     await update.message.reply_text(
-        f"✅ *@{bot_info.username}* is now activated!\n\n"
+        f"{already} *@{bot_info.username}* is ready.\n\n"
         f"👉 Open your bot [@{bot_info.username}](https://t.me/{bot_info.username}) "
-        f"and send /start to begin configuring it.\n\n"
+        f"and send /start to configure it.\n\n"
         f"You are the admin. Regular users won't see the admin panel.",
         parse_mode="Markdown"
     )
