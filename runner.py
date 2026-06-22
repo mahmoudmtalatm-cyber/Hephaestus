@@ -61,29 +61,54 @@ logging.basicConfig(level=logging.INFO)
 # ──────────────────────────────────────────────
 # DB HELPERS
 # ──────────────────────────────────────────────
-def get_user_data(uid):
+def get_user_data(uid, token=None):
     doc = db.collection("users").document(str(uid)).get()
-    return doc.to_dict() if doc.exists else {}
+    data = doc.to_dict() if doc.exists else {}
+    if token:
+        # Return per-token sub-document if available
+        bots = data.get("bots", {})
+        if token in bots:
+            return bots[token]
+    return data
 
-def save_menus(uid, menus):
-    db.collection("users").document(str(uid)).update({"menus": menus})
+def save_menus(uid, menus, token=None):
+    if token:
+        db.collection("users").document(str(uid)).update({f"bots.{token}.menus": menus})
+    else:
+        db.collection("users").document(str(uid)).update({"menus": menus})
 
-def save_welcome(uid, text):
-    db.collection("users").document(str(uid)).update({"welcome_message": text})
+def save_welcome(uid, text, token=None):
+    if token:
+        db.collection("users").document(str(uid)).update({f"bots.{token}.welcome_message": text})
+    else:
+        db.collection("users").document(str(uid)).update({"welcome_message": text})
 
-def get_menus(uid):
-    return get_user_data(uid).get("menus", {})
+def get_menus(uid, token=None):
+    return get_user_data(uid, token).get("menus", {})
 
-def get_welcome(uid):
-    return get_user_data(uid).get("welcome_message", "Welcome!")
+def get_welcome(uid, token=None):
+    return get_user_data(uid, token).get("welcome_message", "Welcome!")
 
 def get_all_admins():
+    """Return one entry per registered bot token (a user may have many)."""
     docs = db.collection("users").stream()
     result = []
     for doc in docs:
         data = doc.to_dict()
-        if data.get("bot_token"):
-            result.append(data | {"uid": doc.id})
+        uid = doc.id
+        # New multi-bot format: bots = { token: { bot_token, bot_username, ... } }
+        bots = data.get("bots", {})
+        if bots:
+            for token, bot_data in bots.items():
+                result.append({
+                    "uid": uid,
+                    "bot_token": token,
+                    "bot_username": bot_data.get("bot_username", ""),
+                    "admin_id": data.get("admin_id", uid),
+                })
+        elif data.get("bot_token"):
+            # Legacy single-token format
+            result.append(data | {"uid": uid})
     return result
 
 def track_button_click(uid, menu_id, btn_label):
@@ -441,12 +466,12 @@ def msg_idx_from_display(display, messages):
 # ──────────────────────────────────────────────
 # FACTORY
 # ──────────────────────────────────────────────
-def make_handlers(owner_uid):
+def make_handlers(owner_uid, owner_token=None):
 
     # ── /start ──
     async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        data = get_user_data(owner_uid)
+        data = get_user_data(owner_uid, owner_token)
         admin_id = data.get("admin_id")
         menus = data.get("menus", {})
 
@@ -474,7 +499,7 @@ def make_handlers(owner_uid):
     # ── /help (admin only) ──
     async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
-        data = get_user_data(owner_uid)
+        data = get_user_data(owner_uid, owner_token)
         if str(user_id) != str(data.get("admin_id")):
             return
         help_text = (
@@ -506,12 +531,12 @@ def make_handlers(owner_uid):
         uid = owner_uid
 
         if text == "Manage Buttons":
-            menus = get_menus(uid)
+            menus = get_menus(uid, owner_token)
             main_menu = get_main_menu(menus)
             if not main_menu:
                 # Auto-create main menu if missing
                 menus["main"] = {"name": "Main", "message": "Choose an option:", "is_main": True, "buttons": []}
-                save_menus(uid, menus)
+                save_menus(uid, menus, owner_token)
                 main_menu = menus["main"]
             context.user_data["current_path"] = []
             buttons = main_menu.get("buttons", [])
@@ -520,7 +545,7 @@ def make_handlers(owner_uid):
             return ADMIN_BTN_LIST
 
         elif text == "💬 Welcome Message":
-            current = get_welcome(uid)
+            current = get_welcome(uid, owner_token)
             await update.message.reply_text(
                 f"💬 *Current:*\n_{current}_\n\nSend the new welcome message:",
                 parse_mode="Markdown",
@@ -558,7 +583,7 @@ def make_handlers(owner_uid):
             return ADMIN_MAIN
 
         elif text == "👁️ Preview Bot":
-            menus = get_menus(uid)
+            menus = get_menus(uid, owner_token)
             main_menu = get_main_menu(menus)
             if not main_menu:
                 await update.message.reply_text(
@@ -568,7 +593,7 @@ def make_handlers(owner_uid):
                 )
                 return ADMIN_MAIN
             btns = main_menu.get("buttons", [])
-            welcome = get_welcome(uid)
+            welcome = get_welcome(uid, owner_token)
             context.user_data["preview_stack"] = ["main"]
             await update.message.reply_text(
                 "👁️ *Preview Mode* — you're now seeing the bot as a user.\nTap *🚪 Exit Preview* to return to admin.",
@@ -578,7 +603,7 @@ def make_handlers(owner_uid):
             return ADMIN_PREVIEW
 
         elif text == "🗑️ Reset All Buttons":
-            menus = get_menus(uid)
+            menus = get_menus(uid, owner_token)
             main_menu = get_main_menu(menus)
             count = len(main_menu.get("buttons", [])) if main_menu else 0
             if count == 0:
@@ -663,7 +688,7 @@ def make_handlers(owner_uid):
                 reply_markup=ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
             )
             return WAITING_RESET_CONFIRM
-        save_menus(uid, {})
+        save_menus(uid, {}, owner_token)
         await update.message.reply_text(
             "✅ *All menus have been reset.*\n\nUse *📋 Manage Menus* to start fresh.",
             parse_mode="Markdown",
@@ -675,7 +700,7 @@ def make_handlers(owner_uid):
     async def admin_btn_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = update.message.text
         uid = owner_uid
-        menus = get_menus(uid)
+        menus = get_menus(uid, owner_token)
         buttons = get_buttons_at_path(menus, [])
         clipboard = context.user_data.get("clipboard")
 
@@ -705,7 +730,7 @@ def make_handlers(owner_uid):
                 if 0 <= src_idx < len(src_buttons):
                     src_buttons.pop(src_idx)
                 context.user_data.pop("clipboard", None)
-            save_menus(uid, menus)
+            save_menus(uid, menus, owner_token)
             await update.message.reply_text(
                 "✅ Pasted!",
                 reply_markup=btn_list_kb(buttons, show_up=False, has_clipboard=bool(context.user_data.get("clipboard")))
@@ -742,7 +767,7 @@ def make_handlers(owner_uid):
         uid = owner_uid
         path = context.user_data.get("current_path", [])
         idx = context.user_data.get("current_btn_idx", 0)
-        menus = get_menus(uid)
+        menus = get_menus(uid, owner_token)
         buttons = get_buttons_at_path(menus, path)
         clipboard = context.user_data.get("clipboard")
 
@@ -874,7 +899,7 @@ def make_handlers(owner_uid):
                 if 0 <= src_idx < len(src_buttons):
                     src_buttons.pop(src_idx)
                 context.user_data.pop("clipboard", None)
-            save_menus(uid, menus)
+            save_menus(uid, menus, owner_token)
             await update.message.reply_text(
                 f"✅ Pasted into *{btn['label']}*'s sub-buttons!", parse_mode="Markdown",
                 reply_markup=detail_kb()
@@ -923,7 +948,7 @@ def make_handlers(owner_uid):
         uid = owner_uid
         path = context.user_data.get("current_path", [])
         idx = context.user_data.get("current_btn_idx", 0)
-        menus = get_menus(uid)
+        menus = get_menus(uid, owner_token)
         buttons = get_buttons_at_path(menus, path)
         clipboard = context.user_data.get("clipboard")
 
@@ -955,7 +980,7 @@ def make_handlers(owner_uid):
                     buttons[idx]["row"] = cur_row - 0.5
                 # If already alone on the top row, do nothing
             _normalize_rows(buttons)
-            save_menus(uid, menus)
+            save_menus(uid, menus, owner_token)
             await update.message.reply_text(reorder_view(idx), parse_mode="Markdown", reply_markup=reorder_kb(idx, buttons))
             return ADMIN_BTN_REORDER
 
@@ -973,7 +998,7 @@ def make_handlers(owner_uid):
                     buttons[idx]["row"] = cur_row + 0.5
                 # If already alone on the bottom row, do nothing
             _normalize_rows(buttons)
-            save_menus(uid, menus)
+            save_menus(uid, menus, owner_token)
             await update.message.reply_text(reorder_view(idx), parse_mode="Markdown", reply_markup=reorder_kb(idx, buttons))
             return ADMIN_BTN_REORDER
 
@@ -985,7 +1010,7 @@ def make_handlers(owner_uid):
                 buttons[idx], buttons[left_idx] = buttons[left_idx], buttons[idx]
                 idx = left_idx
                 context.user_data["current_btn_idx"] = idx
-                save_menus(uid, menus)
+                save_menus(uid, menus, owner_token)
             await update.message.reply_text(reorder_view(idx), parse_mode="Markdown", reply_markup=reorder_kb(idx, buttons))
             return ADMIN_BTN_REORDER
 
@@ -997,7 +1022,7 @@ def make_handlers(owner_uid):
                 buttons[idx], buttons[right_idx] = buttons[right_idx], buttons[idx]
                 idx = right_idx
                 context.user_data["current_btn_idx"] = idx
-                save_menus(uid, menus)
+                save_menus(uid, menus, owner_token)
             await update.message.reply_text(reorder_view(idx), parse_mode="Markdown", reply_markup=reorder_kb(idx, buttons))
             return ADMIN_BTN_REORDER
 
@@ -1006,7 +1031,7 @@ def make_handlers(owner_uid):
             if len(peers) > 1:
                 buttons[idx]["row"] = cur_row - 0.5
                 _normalize_rows(buttons)
-                save_menus(uid, menus)
+                save_menus(uid, menus, owner_token)
             await update.message.reply_text(reorder_view(idx), parse_mode="Markdown", reply_markup=reorder_kb(idx, buttons))
             return ADMIN_BTN_REORDER
 
@@ -1015,7 +1040,7 @@ def make_handlers(owner_uid):
             if len(peers) > 1:
                 buttons[idx]["row"] = cur_row + 0.5
                 _normalize_rows(buttons)
-                save_menus(uid, menus)
+                save_menus(uid, menus, owner_token)
             await update.message.reply_text(reorder_view(idx), parse_mode="Markdown", reply_markup=reorder_kb(idx, buttons))
             return ADMIN_BTN_REORDER
 
@@ -1043,7 +1068,7 @@ def make_handlers(owner_uid):
         uid = owner_uid
         path = context.user_data.get("current_path", [])
         idx = context.user_data.get("current_btn_idx", 0)
-        menus = get_menus(uid)
+        menus = get_menus(uid, owner_token)
         buttons = get_buttons_at_path(menus, path)
         btn = buttons[idx] if idx < len(buttons) else {}
         messages = btn.get("messages", [])
@@ -1079,7 +1104,7 @@ def make_handlers(owner_uid):
         if update.message.text == "🔙 Cancel":
             await update.message.reply_text("❌ Cancelled.", reply_markup=admin_home_kb())
             return ADMIN_MAIN
-        save_welcome(owner_uid, update.message.text.strip())
+        save_welcome(owner_uid, update.message.text.strip(), owner_token)
         await update.message.reply_text("✅ Welcome message updated!", reply_markup=admin_home_kb())
         return ADMIN_MAIN
 
@@ -1089,7 +1114,7 @@ def make_handlers(owner_uid):
         return_to = context.user_data.get("add_btn_return", "list")
 
         if update.message.text == "🔙 Cancel":
-            menus = get_menus(uid)
+            menus = get_menus(uid, owner_token)
             if return_to == "detail":
                 parent_path = context.user_data.get("add_btn_parent_path", [])
                 parent_idx = context.user_data.get("add_btn_parent_idx", 0)
@@ -1110,7 +1135,7 @@ def make_handlers(owner_uid):
             return ADMIN_BTN_LIST
 
         label = update.message.text.strip()
-        menus = get_menus(uid)
+        menus = get_menus(uid, owner_token)
         buttons = get_buttons_at_path(menus, path)
         insert_idx = context.user_data.get("insert_idx")
         insert_before = context.user_data.get("insert_before", False)
@@ -1125,7 +1150,7 @@ def make_handlers(owner_uid):
             buttons.insert(pos, new_btn)
             new_idx = pos
         _normalize_rows(buttons)
-        save_menus(uid, menus)
+        save_menus(uid, menus, owner_token)
         context.user_data["current_btn_idx"] = new_idx
         context.user_data["assigning_to"] = (tuple(path), new_idx)
         context.user_data["temp_messages"] = []
@@ -1143,14 +1168,14 @@ def make_handlers(owner_uid):
         uid = owner_uid
         path = context.user_data.get("current_path", [])
         idx = context.user_data.get("current_btn_idx", 0)
-        menus = get_menus(uid)
+        menus = get_menus(uid, owner_token)
         buttons = get_buttons_at_path(menus, path)
         if update.message.text == "🔙 Cancel":
             btn = buttons[idx]
             await update.message.reply_text("❌ Cancelled.", reply_markup=btn_detail_kb(idx, len(buttons), btn["type"], sub_buttons=btn.get("buttons", []), has_clipboard=bool(context.user_data.get("clipboard"))))
             return ADMIN_BTN_DETAIL
         buttons[idx]["label"] = update.message.text.strip()
-        save_menus(uid, menus)
+        save_menus(uid, menus, owner_token)
         btn = buttons[idx]
         await update.message.reply_text("✅ Label updated!", reply_markup=btn_detail_kb(idx, len(buttons), btn["type"], sub_buttons=btn.get("buttons", []), has_clipboard=bool(context.user_data.get("clipboard"))))
         return ADMIN_BTN_DETAIL
@@ -1159,11 +1184,11 @@ def make_handlers(owner_uid):
         uid = owner_uid
         path = context.user_data.get("current_path", [])
         if update.message.text == "🔙 Cancel":
-            buttons = get_buttons_at_path(get_menus(uid), path)
+            buttons = get_buttons_at_path(get_menus(uid, owner_token), path)
             await update.message.reply_text("❌ Cancelled.", reply_markup=btn_list_kb(buttons, show_up=bool(path), has_clipboard=bool(context.user_data.get("clipboard"))))
             return ADMIN_BTN_LIST
         label = update.message.text.strip()
-        menus = get_menus(uid)
+        menus = get_menus(uid, owner_token)
         buttons = get_buttons_at_path(menus, path)
         insert_idx = context.user_data.get("insert_idx")
         insert_before = context.user_data.get("insert_before", False)
@@ -1172,7 +1197,7 @@ def make_handlers(owner_uid):
         pos = insert_idx if insert_before else insert_idx + 1
         buttons.insert(pos, new_btn)
         _normalize_rows(buttons)
-        save_menus(uid, menus)
+        save_menus(uid, menus, owner_token)
         new_idx = pos
         context.user_data["current_btn_idx"] = new_idx
         context.user_data["assigning_to"] = (tuple(path), new_idx)
@@ -1199,7 +1224,7 @@ def make_handlers(owner_uid):
             context.user_data["current_btn_idx"] = btn_idx
 
             if not cancelled and temp:
-                menus = get_menus(uid)
+                menus = get_menus(uid, owner_token)
                 buttons = get_buttons_at_path(menus, path)
                 append = context.user_data.get("append_to_existing", False)
                 if append:
@@ -1207,7 +1232,7 @@ def make_handlers(owner_uid):
                     buttons[btn_idx]["messages"] = existing + temp
                 else:
                     buttons[btn_idx]["messages"] = temp
-                save_menus(uid, menus)
+                save_menus(uid, menus, owner_token)
                 btn = buttons[btn_idx]
                 total = len(btn["messages"])
                 await update.message.reply_text(
@@ -1246,7 +1271,7 @@ def make_handlers(owner_uid):
         path = context.user_data.get("current_path", [])
         btn_idx = context.user_data.get("current_btn_idx", 0)
         msg_idx = context.user_data.get("current_msg_idx", 0)
-        menus = get_menus(uid)
+        menus = get_menus(uid, owner_token)
         buttons = get_buttons_at_path(menus, path)
         messages = buttons[btn_idx].get("messages", [])
 
@@ -1260,7 +1285,7 @@ def make_handlers(owner_uid):
             return WAITING_EDIT_MESSAGE
 
         messages[msg_idx] = serialized
-        save_menus(uid, menus)
+        save_menus(uid, menus, owner_token)
 
         if context.user_data.pop("preview_return", False):
             messages = buttons[btn_idx].get("messages", [])
@@ -1281,7 +1306,7 @@ def make_handlers(owner_uid):
         btn_idx = context.user_data.get("current_btn_idx", 0)
         msg_idx = context.user_data.get("current_msg_idx", 0)
         before = context.user_data.get("insert_msg_before", False)
-        menus = get_menus(uid)
+        menus = get_menus(uid, owner_token)
         buttons = get_buttons_at_path(menus, path)
         messages = buttons[btn_idx].get("messages", [])
 
@@ -1293,7 +1318,7 @@ def make_handlers(owner_uid):
                 pos = msg_idx if before else msg_idx + 1
                 for i, m in enumerate(temp):
                     messages.insert(pos + i, m)
-                save_menus(uid, menus)
+                save_menus(uid, menus, owner_token)
                 context.user_data["current_msg_idx"] = pos
 
                 if context.user_data.pop("preview_return", False):
@@ -1331,7 +1356,7 @@ def make_handlers(owner_uid):
         text = update.message.text
         uid = owner_uid
         path = context.user_data.get("current_path", [])
-        menus = get_menus(uid)
+        menus = get_menus(uid, owner_token)
 
         if text == "✅ Yes, delete":
             dtype = context.user_data.get("delete_type")
@@ -1341,7 +1366,7 @@ def make_handlers(owner_uid):
                 buttons = get_buttons_at_path(menus, path)
                 if idx < len(buttons):
                     removed = buttons.pop(idx)
-                    save_menus(uid, menus)
+                    save_menus(uid, menus, owner_token)
 
                     if path:
                         # Deleted a sub-button: return to the parent's
@@ -1383,7 +1408,7 @@ def make_handlers(owner_uid):
                 messages = buttons[btn_idx].get("messages", [])
                 if msg_idx < len(messages):
                     messages.pop(msg_idx)
-                    save_menus(uid, menus)
+                    save_menus(uid, menus, owner_token)
 
                 if context.user_data.pop("preview_return", False) and messages:
                     await update.message.reply_text(f"🗑️ Message #{msg_idx+1} deleted. Re-previewing:")
@@ -1502,7 +1527,7 @@ def make_handlers(owner_uid):
     async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nudge_keepalive()
         user_id = update.effective_user.id
-        data = get_user_data(owner_uid)
+        data = get_user_data(owner_uid, owner_token)
         if str(user_id) == str(data.get("admin_id")):
             return
 
@@ -1578,7 +1603,7 @@ def make_handlers(owner_uid):
         uid = owner_uid
         mid = context.user_data.get("current_mid")
         btn_idx = context.user_data.get("current_btn_idx", 0)
-        menus = get_menus(uid)
+        menus = get_menus(uid, owner_token)
         buttons = menus.get(mid, {}).get("buttons", [])
         btn = buttons[btn_idx] if btn_idx < len(buttons) else {}
         messages = btn.get("messages", [])
@@ -1588,7 +1613,7 @@ def make_handlers(owner_uid):
             idx = int(data.split(":")[1])
             if idx > 0:
                 messages[idx], messages[idx-1] = messages[idx-1], messages[idx]
-                save_menus(uid, menus)
+                save_menus(uid, menus, owner_token)
                 # Refresh inline buttons on all messages by re-sending them
                 await query.message.reply_text("✅ Moved up! Re-sending preview...")
                 for i, msg_data in enumerate(messages):
@@ -1600,7 +1625,7 @@ def make_handlers(owner_uid):
             idx = int(data.split(":")[1])
             if idx < total - 1:
                 messages[idx], messages[idx+1] = messages[idx+1], messages[idx]
-                save_menus(uid, menus)
+                save_menus(uid, menus, owner_token)
                 await query.message.reply_text("✅ Moved down! Re-sending preview...")
                 for i, msg_data in enumerate(messages):
                     await send_stored_message(context.bot, query.message.chat_id, msg_data,
@@ -1702,7 +1727,7 @@ async def start_bot(admin):
         return None
     try:
         app = Application.builder().token(token).build()
-        conv, user_handler, cb_handler = make_handlers(uid)
+        conv, user_handler, cb_handler = make_handlers(uid, owner_token=token)
         app.add_handler(conv, group=0)
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, user_handler), group=1)
         app.add_handler(CallbackQueryHandler(cb_handler, pattern=r"^(pmv_up|pmv_dn|pedit|pdel|pins_b|pins_a):"), group=0)
@@ -1728,11 +1753,11 @@ async def run_all_bots():
                 token = admin.get("bot_token")
                 if not uid or not token:
                     continue
-                if uid not in running:
+                if token not in running:
                     print(f"🆕 New bot detected: @{admin.get('bot_username', uid)}")
                     app = await start_bot(admin)
                     if app:
-                        running[uid] = app
+                        running[token] = app
             if not running:
                 print("⚠️  No bots running yet. Waiting for a token to be submitted...")
             await asyncio.sleep(10)
