@@ -339,6 +339,10 @@ def msg_inline_action_kb(idx, total):
         InlineKeyboardButton("✏️ Edit", callback_data=f"pedit:{idx}"),
         InlineKeyboardButton("🗑️ Delete", callback_data=f"pdel:{idx}"),
     ])
+    rows.append([
+        InlineKeyboardButton("⬆️ Insert Before", callback_data=f"pins_b:{idx}"),
+        InlineKeyboardButton("⬇️ Insert After", callback_data=f"pins_a:{idx}"),
+    ])
     return InlineKeyboardMarkup(rows)
 
 def _normalize_rows(buttons):
